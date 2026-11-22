@@ -215,15 +215,132 @@ def _parse_str_tuple(raw: Any) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _parse_patterns(raw: Any) -> tuple[str, ...]:
+MAX_PROTECT_PATTERNS = 32
+MAX_PROTECT_PATTERN_CHARS = 200
+MAX_PROTECT_REPEAT = 32
+MAX_PROTECT_COST = 128
+MAX_PROTECT_TOTAL_COST = 256
+
+
+def _validate_protect_structure(pattern: str) -> int:
+    from re import _constants as const
+    from re import _parser as parser
+
+    repeats = (const.MAX_REPEAT, const.MIN_REPEAT, const.POSSESSIVE_REPEAT)
+    cost = 1
+
+    def walk(sub: Any) -> tuple[bool, int]:
+        nonlocal cost
+        has_repeats = False
+        width = 0
+        for op, value in sub:
+            width += 1
+            if op in (const.GROUPREF, const.GROUPREF_EXISTS):
+                raise ValueError("protect patterns must not contain backreferences or conditional groups")
+            if op in repeats:
+                if value[1] == const.MAXREPEAT:
+                    raise ValueError("protect patterns must not contain unbounded quantifiers; use bounded repeats")
+                if value[1] > MAX_PROTECT_REPEAT:
+                    raise ValueError(f"protect repeat maximum must be at most {MAX_PROTECT_REPEAT}")
+                _, body_width = walk(value[2])
+                cost *= (value[1] + 1) * max(1, body_width)
+                has_repeats = True
+                width += body_width
+            elif op == const.SUBPATTERN:
+                repeated, body_width = walk(value[3])
+                has_repeats |= repeated
+                width += body_width
+            elif op == const.BRANCH:
+                repeated_branches = [walk(branch) for branch in value[1]]
+                width += sum(size for _, size in repeated_branches)
+                if any(repeated for repeated, _ in repeated_branches):
+                    cost *= len(value[1])
+                    has_repeats = True
+            elif op in (const.ASSERT, const.ASSERT_NOT):
+                repeated, body_width = walk(value[1])
+                has_repeats |= repeated
+                width += body_width
+            elif op == const.ATOMIC_GROUP:
+                repeated, body_width = walk(value)
+                has_repeats |= repeated
+                width += body_width
+            if cost > MAX_PROTECT_COST:
+                raise ValueError(f"protect pattern backtracking cost must be at most {MAX_PROTECT_COST}")
+        return has_repeats, width
+
+    walk(parser.parse(pattern))
+    return cost
+
+
+def _split_protect_patterns(raw: str, warn: Callable[[str], None] | None = None) -> list[str]:
+    if len(raw) > MAX_PROTECT_PATTERNS * (MAX_PROTECT_PATTERN_CHARS + 1):
+        raise ValueError("raw protect patterns length limit exceeded; whole override discarded; trying next layer")
+    fragments = []
+    start = 0
+    for token in re.finditer(r"\\[\s\S]|\{(?:[0-9]+(?:,[0-9]*)?|,[0-9]*)\}|,", raw):
+        if token.group() == ",":
+            fragments.append(raw[start:token.start()])
+            start = token.end()
+            if len(fragments) >= MAX_PROTECT_PATTERNS * 4:
+                raise ValueError("protect patterns fragment limit exceeded; whole override discarded; trying next layer")
+    fragments.append(raw[start:])
+    items = []
+    index = 0
+    while index < len(fragments):
+        pattern = fragments[index]
+        merged = None
+        for end in range(index, len(fragments)):
+            if end > index:
+                pattern += "," + fragments[end]
+            if len(pattern) > MAX_PROTECT_PATTERN_CHARS:
+                break
+            try:
+                re.compile(pattern)
+            except (re.error, OverflowError, RecursionError):
+                continue
+            if end > index and warn is not None:
+                warn(f"kept merged comma-containing regex {pattern!r}; use a YAML list to avoid ambiguity")
+            merged = pattern
+            break
+        if merged is None:
+            items.append(fragments[index])
+            index += 1
+        else:
+            items.append(merged)
+            index = end + 1
+    return items
+
+
+def _parse_patterns(raw: Any, warn: Callable[[str], None] | None = None) -> tuple[str, ...]:
     """Like ``_parse_str_tuple``, and every entry must compile (an env value splits on commas)."""
-    patterns = _parse_str_tuple(raw)
+    from .recovery import _backtracking_risk
+
+    patterns = _parse_str_tuple(_split_protect_patterns(raw, warn) if isinstance(raw, str) else raw)
+    if len(patterns) > MAX_PROTECT_PATTERNS:
+        raise ValueError(f"at most {MAX_PROTECT_PATTERNS} protect patterns are allowed; whole override discarded; trying next layer")
+    if any(len(pattern) > MAX_PROTECT_PATTERN_CHARS for pattern in patterns):
+        raise ValueError(f"protect patterns must be at most {MAX_PROTECT_PATTERN_CHARS} characters; whole override discarded; trying next layer")
+    accepted = []
+    total_cost = 0
     for pattern in patterns:
         try:
             re.compile(pattern)
-        except (re.error, OverflowError, RecursionError) as exc:
-            raise ValueError(f"invalid regex {pattern!r}: {exc}") from None
-    return patterns
+            cost = _validate_protect_structure(pattern)
+            if _backtracking_risk(pattern):
+                raise ValueError("protect patterns must not contain nested repeats or repeated alternation")
+            if total_cost + cost > MAX_PROTECT_TOTAL_COST:
+                raise ValueError(f"protect patterns total cost must be at most {MAX_PROTECT_TOTAL_COST}")
+        except (re.error, ValueError, OverflowError, RecursionError) as exc:
+            reason = f"invalid regex {pattern!r}: {exc}"
+            if warn is None:
+                raise ValueError(reason) from None
+            warn(f"{reason}; ignored")
+        else:
+            accepted.append(pattern)
+            total_cost += cost
+    if patterns and not accepted:
+        raise ValueError("no valid protect patterns remain")
+    return tuple(accepted)
 
 
 _SETTING_PARSERS: dict[str, Callable[[Any], Any]] = {
@@ -390,10 +507,15 @@ def _load_settings(ctx: Any, env: Mapping[str, str], warnings: list[str]) -> Tam
             (f"{label}.{name}", mapping[name]) for label, mapping in file_layers if mapping.get(name) is not None
         ]
         for label, raw in candidates:
+            warning_count = len(warnings)
             try:
-                chosen[name] = parse(raw)
+                if name == "protect_patterns":
+                    chosen[name] = _parse_patterns(raw, lambda reason: warnings.append(f"{label}: {reason}"))
+                else:
+                    chosen[name] = parse(raw)
             except ValueError as exc:
-                warnings.append(f"{label}={_short(raw)}: {exc}; ignored")
+                if len(warnings) == warning_count or "whole override discarded" in str(exc):
+                    warnings.append(f"{label}={_short(raw)}: {exc}; ignored")
             else:
                 break
     if 'policy_mode' not in chosen:

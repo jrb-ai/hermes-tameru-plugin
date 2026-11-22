@@ -84,7 +84,7 @@ ENV_SAMPLES = {
     "min_savings": ("0.5", 0.5),
     "brief_share": ("0.4", 0.4),
     "exempt_tools": ("a, b", ("a", "b")),
-    "protect_patterns": (r"\bID-\d+\b", (r"\bID-\d+\b",)),
+    "protect_patterns": (r"\bID-\d{12}\b", (r"\bID-\d{12}\b",)),
     "anchor_errors": ("off", False),
     "prose_brief": ("no", False),
     "expand_tool": ("no", False),
@@ -304,7 +304,7 @@ BAD_ENV = [
     ("enabled", "maybe"), ("enabled", ""), ("min_tool_chars", "abc"), ("min_tool_chars", "-1"),
     ("min_tool_chars", "1.5"), ("max_extract_chars", "0"), ("brief_chars", "x"), ("min_savings", "1.0"),
     ("min_savings", "-0.1"), ("brief_share", "1.5"), ("min_savings", "nan"), ("min_savings", "inf"), ("min_savings", "high"),
-    ("max_risk", "extreme"), ("prune_tail", "weeks"), ("protect_patterns", "ok,(unclosed"), ("store_max_entries", "-5"),
+    ("max_risk", "extreme"), ("prune_tail", "weeks"), ("protect_patterns", "(unclosed"), ("store_max_entries", "-5"),
     ("default_proactive_prune_tokens", "-1"), ("default_proactive_prune_ratio", "1.5"), ("small_window_prune_ratio", "1.5"),
     ("retained_extract_budget_ratio", "1.0"), ("retained_extract_budget_ratio", "-0.1"),
     ("retained_extract_budget_ratio", "nan"), ("retained_extract_budget_ratio", "wide"),
@@ -342,6 +342,17 @@ def test_an_invalid_value_falls_through_to_the_next_layer(hermes_config):
     settings, warnings = load_settings(env={ENV + "MIN_TOOL_CHARS": "lots"})
     assert settings.min_tool_chars == 500
     assert len(warnings) == 1 and ENV + "MIN_TOOL_CHARS" in warnings[0]
+
+
+@pytest.mark.parametrize("raw, patterns", [
+    ("(unclosed", ["TODO"]),
+    (r"\d+", [r"\bID-\d{1,8}\b"]),
+])
+def test_invalid_protect_patterns_env_falls_back_to_yaml(hermes_config, raw, patterns):
+    hermes_config(plugin_config(protect_patterns=patterns))
+    settings, warnings = load_settings(env={ENV + "PROTECT_PATTERNS": raw})
+    assert settings.protect_patterns == tuple(patterns)
+    assert len(warnings) == 1 and ENV + "PROTECT_PATTERNS" in warnings[0]
 
 
 def test_one_bad_value_does_not_spoil_the_others(hermes_config):
