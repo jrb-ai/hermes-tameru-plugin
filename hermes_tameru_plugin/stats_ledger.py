@@ -44,8 +44,9 @@ def _read() -> dict:
         record = json.loads(_path().read_text(encoding="utf-8"))
         days = record.get("days") if isinstance(record, dict) and record.get("version") == VERSION else None
         if isinstance(days, dict):
-            return {d: v for d, v in days.items() if isinstance(d, str) and isinstance(v, dict)}
-    except (OSError, ValueError, TypeError, AttributeError):
+            return {d: v for d, v in days.items() if isinstance(d, str) and isinstance(v, dict)
+                    and all(type(v.get(key, 0)) is int and v.get(key, 0) >= 0 for key in ("cleanups", "tokens"))}
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError):
         pass
     return {}
 
@@ -90,9 +91,16 @@ def record_cleanup(removed_tokens: int, now: float | None = None) -> bool:
             today["cleanups"] = int(today.get("cleanups", 0)) + 1
             today["tokens"] = int(today.get("tokens", 0)) + removed_tokens
             fd, tmp = tempfile.mkstemp(dir=str(_dir()), prefix="stats-", suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"version": VERSION, "days": days}, handle, sort_keys=True)
-            os.replace(tmp, _path())
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump({"version": VERSION, "days": days}, handle, sort_keys=True)
+                os.replace(tmp, _path())
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         return True
     except Exception:
         return False

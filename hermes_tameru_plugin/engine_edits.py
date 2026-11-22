@@ -103,7 +103,10 @@ class EditsMixin:
 
     def _edit_original(self, change: Change) -> str:
         """The screened original of a shortened output, or a PolicyError saying why there is none."""
+        lifecycle_id = self._activity.lifecycle_id
         entry, source = lookup_original(self._store, change.ref, self._session_original_lookup(), cache=False)
+        if self._activity.lifecycle_id != lifecycle_id:
+            raise PolicyError("The active session changed. Open context details again.")
         if source == SECRET_SOURCE:
             raise PolicyError("Held a secret, so Tameru does not keep or show it.")
         text = screen_original(entry.text) if entry is not None else None
@@ -149,30 +152,37 @@ class EditsMixin:
             if verb == "cancel":
                 gone = self._edits.cancel()
                 return {"message": f"Cancelled {gone} pending change{'' if gone == 1 else 's'}."}
-            matches = [c for c in self._activity.rows() if len(ref) >= 8 and c.ref.startswith(ref)]
+            refs = {c.ref for c in self._activity.rows()}
+            if verb == "unkeep":
+                refs.update(self._edits.pins())
+            matches = [key for key in refs if len(ref) >= 8 and key.startswith(ref)]
             if len(matches) > 1:
                 raise PolicyError("That reference matches more than one output. Use the full reference.")
-            change = matches[0] if matches else None
+            if not matches:
+                raise PolicyError("Tameru has no shortened output with that reference in this chat.")
+            full_ref = matches[0]
+            if verb == "unkeep":
+                dropped = self._edits.drop(full_ref)
+                from .session_edits import save
+                save(self)
+                return {"message": "Unpinned." if dropped else "That output was not kept."}
+            change = self._activity.get(full_ref)
             if change is None:
                 raise PolicyError("Tameru has no shortened output with that reference in this chat.")
             if not change.live:
                 raise PolicyError("That output is no longer shortened in this chat.")
-            if verb == "unkeep":
-                dropped = self._edits.drop(change.ref)
-                from .session_edits import save
-                save(self)
-                return {"message": "Unpinned." if dropped else "That output was not kept."}
             if verb not in ("keep", "restore"):
                 raise PolicyError("Use keep, unkeep, restore or cancel.")
             if change.external:
                 raise PolicyError("Web output: use Re-Read instead.")
             delta = max(0, len(self._edit_original(change)) - change.after_chars)
             entry = self._edits.entries.get(change.ref)
-            held = self._edits.held_chars() - (entry["delta"] if entry else 0)
+            reserved = entry["delta"] if entry and entry["state"] in ("pending", "applied") else 0
+            held = self._edits.held_chars() - reserved
             if held + delta > held_budget_chars(getattr(self, "threshold_tokens", 0)):
                 raise PolicyError("Keep limit reached. Unkeep something first." if verb == "keep"
                                   else "Too big to restore right now.")
-            if self._edit_would_crowd(delta // 4 - (entry["delta"] // 4 if entry else 0)):
+            if self._edit_would_crowd(delta // 4 - reserved // 4):
                 raise PolicyError("Memory nearly full. Restoring would make Hermes summarise this chat.")
             if change.ref not in self._edits.entries and len(self._edits.entries) >= _EDIT_MAX:
                 raise PolicyError("Too many edits. Cancel or unkeep some first.")
@@ -198,6 +208,7 @@ class EditsMixin:
             if not isinstance(messages, list) or not self.edits_enabled():
                 return None
             with self._activity.lifecycle_lock:
+                lifecycle_id = self._activity.lifecycle_id
                 active = self._edits.active()
                 if not active:
                     return None
@@ -220,12 +231,16 @@ class EditsMixin:
                     try:
                         original = self._edit_original(change)
                     except PolicyError as refusal:
+                        if self._activity.lifecycle_id != lifecycle_id:
+                            return None
                         self._edits.fail(ref, str(refusal))
                         continue
                     found.append((0 if active[ref] == "keep" else 1, -index, ref, index, original))
                 for ref in active:
                     if ref not in seen:
                         self._edits.fail(ref, "Not in this chat's history")
+                if self._activity.lifecycle_id != lifecycle_id:
+                    return None
                 budget = held_budget_chars(getattr(self, "threshold_tokens", 0))
                 out, used, applied = list(messages), 0, []
                 base_tokens = message_budget_tokens(messages)

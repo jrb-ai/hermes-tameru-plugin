@@ -204,6 +204,23 @@ def test_a_read_with_a_limit_hermes_clamped_covers_nothing_past_the_clamp(transc
     assert t.why(0) is None, "only lines 1-2000 came back"
 
 
+@pytest.mark.parametrize("returned_end", [500, 1000])
+def test_a_paginated_reread_covers_only_its_numbered_content(transcript, returned_end):
+    args = {"path": "a.py", "limit": 1000}
+    complete = "\n".join("content" for _ in range(1000))
+    later = read("\n".join("content" for _ in range(returned_end)), total_lines=2000, truncated=True)
+    t = transcript(("read_file", args, read(complete)), ("read_file", args, later))
+    assert t.why(0) == ((1, "re-read") if returned_end == 1000 else None)
+
+
+@pytest.mark.parametrize("content", [None, "", "not numbered", "9" * 5000 + "|content"])
+def test_a_truncated_read_without_parseable_content_has_unknown_coverage(transcript, content):
+    cut = json.dumps({"content": content, "truncated": True})
+    args = {"path": "a.py", "limit": 100}
+    t = transcript(("read_file", args, read()), ("read_file", args, cut))
+    assert t.why(0) is None
+
+
 def test_an_unchanged_stub_does_not_replace_the_read_it_points_at(transcript):
     stub = json.dumps({
         "status": "unchanged", "message": "File unchanged since last read.", "path": "a.py",
@@ -214,6 +231,47 @@ def test_an_unchanged_stub_does_not_replace_the_read_it_points_at(transcript):
         ("read_file", {"path": "a.py"}, stub),
     )
     assert t.why(0) is None
+
+
+@pytest.mark.parametrize("args", [{"path": "a.py"}, {"path": "a.py", "limit": 100}])
+def test_an_identical_read_cannot_bypass_truncated_range_coverage(transcript, args):
+    cut = json.dumps({"content": "1|x", "truncated": True, "next_offset": 10})
+    t = transcript(
+        ("read_file", args, read("the complete earlier read")),
+        ("read_file", args, cut),
+    )
+    assert t.why(0) is None
+
+
+def test_an_identical_successful_read_still_replaces_an_earlier_error(transcript):
+    args = {"path": "a.py", "limit": 100}
+    cut = json.dumps({"content": "1|x", "truncated": True, "next_offset": 10})
+    t = transcript(
+        ("read_file", args, json.dumps({"error": "permission denied"})),
+        ("read_file", args, cut),
+    )
+    assert t.why(0) == (1, "repeated-call")
+
+
+@pytest.mark.parametrize("next_offset", [5, 10, 20])
+@pytest.mark.parametrize("reason", ["re-read", "repeated-call"])
+def test_identical_truncated_reads_supersede_the_lines_actually_returned(transcript, next_offset, reason):
+    args = {"path": "a.py", "limit": 100}
+    first = json.dumps({"content": "1|x", "truncated": True, "next_offset": 10})
+    later = json.dumps({"content": "1|x", "truncated": True, "next_offset": next_offset})
+    t = transcript(("read_file", args, first), ("read_file", args, later))
+    if reason == "repeated-call":
+        t.index.reads.clear()
+    assert t.why(0) == ((1, reason) if next_offset >= 10 else None)
+
+
+def test_a_different_reread_covers_an_earlier_truncated_results_returned_lines(transcript):
+    cut = json.dumps({"content": "1|x", "truncated": True, "next_offset": 10})
+    t = transcript(
+        ("read_file", {"path": "a.py", "limit": 100}, cut),
+        ("read_file", {"path": "a.py", "limit": 9}, read()),
+    )
+    assert t.why(0) == (1, "re-read")
 
 
 def test_a_later_read_that_failed_does_not_supersede(transcript):

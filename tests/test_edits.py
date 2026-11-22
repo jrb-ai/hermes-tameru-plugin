@@ -156,6 +156,13 @@ def test_an_unknown_reference_is_refused(bad):
         engine.edit_change("restore", bad)
 
 
+def test_a_missing_activity_lookup_is_reported_as_an_unknown_reference(monkeypatch):
+    engine, out, idx, ref, original = _shortened()
+    monkeypatch.setattr(engine._activity, "get", lambda _: None)
+    with pytest.raises(PolicyError, match="no shortened output with that reference"):
+        engine.edit_change("restore", ref)
+
+
 def test_edits_can_be_switched_off():
     engine, out, idx, ref, original = _shortened(edits=False)
     assert engine.activity_snapshot()["capabilities"]["restore"] is False
@@ -169,6 +176,15 @@ def test_the_held_budget_is_a_share_of_hermes_compaction_point_with_a_ceiling():
     assert held_budget_chars(100_000) == 15_000 * 4
     assert held_budget_chars(10_000_000) == 40_000 * 4
     assert held_budget_chars(0) == held_budget_chars(None) == 10_000 * 4
+
+
+@pytest.mark.parametrize("threshold", [float("inf"), -float("inf"), float("nan")])
+def test_nonfinite_thresholds_use_the_unknown_size_budget(threshold):
+    assert held_budget_chars(threshold) == held_budget_chars(None)
+
+
+def test_an_arbitrarily_large_integer_threshold_still_caps_the_held_budget():
+    assert held_budget_chars(10**1000) == 40_000 * 4
 
 
 def test_a_restore_that_does_not_fit_is_refused_and_a_late_overflow_fails_honestly():
@@ -192,6 +208,27 @@ def test_a_keep_is_refused_with_its_own_wording_when_the_limit_is_reached():
         engine.edit_change("keep", ref)
 
 
+@pytest.mark.parametrize("state", ["expired", "failed"])
+def test_requeueing_an_inactive_edit_does_not_discount_the_held_budget(monkeypatch, state):
+    engine, out, idx, ref, original = _shortened()
+    engine.edit_change("restore", ref)
+    if state == "expired":
+        for _ in range(RESTORE_TURNS + 1):
+            _turn(engine)
+    else:
+        engine._edits.fail(ref, "Not sent")
+    assert engine._edits.held_chars() == 0
+    delta = max(0, len(original) - len(out[idx]["content"]))
+    monkeypatch.setattr(edits_module, "held_budget_chars", lambda _: delta - 1)
+    with pytest.raises(PolicyError, match="Too big"):
+        engine.edit_change("restore", ref)
+    assert engine._edits.entries[ref]["state"] == state
+    monkeypatch.setattr(edits_module, "held_budget_chars", lambda _: delta)
+    engine.edit_change("restore", ref)
+    engine.edit_change("restore", ref)
+    assert engine._edits.held_chars() == delta
+
+
 # ---- restores let go, keeps stay ---------------------------------------------------------------------------
 def test_a_restore_lasts_a_few_replies_and_then_lets_go():
     engine, out, idx, ref, original = _shortened()
@@ -212,6 +249,29 @@ def test_a_keep_does_not_expire_and_unkeep_lets_it_go():
     assert engine._edits_overlay(out)[idx]["content"] == original
     assert engine.edit_change("unkeep", ref)["message"] == "Unpinned."
     assert engine._edits_overlay(out) is None
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_a_keep_can_be_removed_after_its_shortened_row_changes_or_disappears(missing):
+    engine, out, idx, ref, original = _shortened()
+    engine.edit_change("keep", ref)
+    messages = [] if missing else [*out[:idx], dict(out[idx], content="Hermes changed it"), *out[idx + 1:]]
+    engine._activity.refresh(messages)
+    with pytest.raises(PolicyError, match="no longer shortened"):
+        engine.edit_change("restore", ref)
+    assert engine.edit_change("unkeep", ref)["message"] == "Unpinned."
+    assert engine._edits.pins() == []
+    assert engine.edit_change("unkeep", ref)["message"] == "That output was not kept."
+
+
+def test_a_keep_can_be_removed_after_its_activity_record_is_evicted():
+    engine, out, idx, ref, original = _shortened()
+    engine.edit_change("keep", ref)
+    engine._activity.clear()
+    assert engine.edit_change("unkeep", ref)["message"] == "Unpinned."
+    assert engine._edits.pins() == []
+    with pytest.raises(PolicyError, match="no shortened output"):
+        engine.edit_change("unkeep", ref)
 
 
 def test_a_keep_survives_a_restart_and_applies_again_once_the_row_is_back():
@@ -266,6 +326,48 @@ def test_a_missing_row_is_reported_as_gone_not_applied():
     assert engine._edits_overlay([m for i, m in enumerate(out) if i != idx]) is None
     entry = engine.activity_snapshot()["edits"][ref]
     assert entry["state"] == "failed" and "history" in entry["reason"]
+
+
+def test_an_overlay_is_discarded_when_an_archive_read_resets_the_session():
+    db = _MetaDB()
+    engine, out, idx, ref, original = _shortened(db)
+    engine.edit_change("restore", ref)
+    _turn(engine)
+    engine._store.clear()
+    def resetting_read(*args, **kwargs):
+        engine.on_session_reset()
+        return [engine._archive_row]
+    db.get_messages = resetting_read
+    assert engine._edits_overlay(out) is None
+    assert engine._edits.entries == {} and engine._edits_inflight == []
+
+
+def test_an_edit_is_not_queued_when_its_archive_read_resets_the_session():
+    db = _MetaDB()
+    engine, out, idx, ref, original = _shortened(db)
+    engine._store.clear()
+    def resetting_read(*args, **kwargs):
+        engine.on_session_reset()
+        return [engine._archive_row]
+    db.get_messages = resetting_read
+    with pytest.raises(PolicyError, match="active session changed"):
+        engine.edit_change("keep", ref)
+    assert engine._edits.entries == {}
+
+
+def test_a_stale_overlay_does_not_fail_a_new_sessions_pins():
+    db = _MetaDB()
+    engine, out, idx, ref, original = _shortened(db)
+    engine.edit_change("keep", ref)
+    _turn(engine)
+    engine._store.clear()
+    def rebinding_read(*args, **kwargs):
+        engine.bind_session_state(session_db=db, session_id="s2")
+        engine._edits.load_pins([ref])
+        return [engine._archive_row]
+    db.get_messages = rebinding_read
+    assert engine._edits_overlay(out) is None
+    assert engine._edits.entries[ref]["state"] == "pending"
 
 
 def test_randomised_conversations_keep_the_overlay_safe():

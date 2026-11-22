@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
+from pathlib import Path
 
 import pytest
 from engine_support import make_engine
@@ -49,6 +51,50 @@ def test_a_corrupt_file_reads_as_empty_and_is_replaced(folder):
     (folder / "stats-ledger.json").write_text("{not json")
     assert ledger.summary() is None
     assert ledger.record_cleanup(50) and ledger.summary()["tokens"] == 50
+
+
+@pytest.mark.parametrize("values", [
+    {"cleanups": "broken", "tokens": 100},
+    {"cleanups": 1, "tokens": None},
+    {"cleanups": True, "tokens": -100},
+    {"cleanups": 1, "tokens": []},
+])
+def test_invalid_daily_counters_do_not_poison_future_writes(folder, values):
+    path = folder / "stats-ledger.json"
+    path.write_text(json.dumps({"version": 1, "days": {ledger._day(): values}}))
+    assert ledger.summary() is None
+    assert ledger.record_cleanup(50)
+    assert ledger.summary() == {"days": 7, "active_days": 1, "cleanups": 1, "tokens": 50}
+
+
+def test_deeply_nested_json_is_ignored_instead_of_escaping_the_stats_command(folder):
+    depth = sys.getrecursionlimit() + 100
+    (folder / "stats-ledger.json").write_text("[" * depth + "0" + "]" * depth)
+    assert ledger.summary() is None
+    assert "Last 7 days" not in _command("stats", stats_ledger=True)
+    assert ledger.record_cleanup(50) and ledger.summary()["tokens"] == 50
+
+
+def test_a_failed_atomic_replace_removes_the_temporary_file(folder, monkeypatch):
+    assert ledger.record_cleanup(50)
+    def fail_replace(*args):
+        raise OSError("disk full")
+    monkeypatch.setattr(ledger.os, "replace", fail_replace)
+    assert ledger.record_cleanup(10) is False
+    assert ledger.summary()["tokens"] == 50
+    assert list(folder.glob("stats-*.tmp")) == []
+    assert list(folder.glob("*.lock")) == []
+
+
+def test_a_successful_replace_does_not_unlink_a_reused_temporary_name(folder, monkeypatch):
+    replace = ledger.os.replace
+    def reuse_name(source, target):
+        replace(source, target)
+        Path(source).write_text("another writer")
+    monkeypatch.setattr(ledger.os, "replace", reuse_name)
+    assert ledger.record_cleanup(10)
+    temporary, = folder.glob("stats-*.tmp")
+    assert temporary.read_text() == "another writer"
 
 
 def test_a_stale_lock_does_not_block_forever(folder):

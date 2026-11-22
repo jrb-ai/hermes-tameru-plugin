@@ -22,6 +22,7 @@ from hermes_tameru_plugin.recovery import (
     MAX_SCAN_ROWS,
     OriginalStore,
     StoredOriginal,
+    _error,
     expand,
     session_lookup_factory,
 )
@@ -231,6 +232,27 @@ def test_expand_is_exact_about_line_breaks_and_text():
     assert out["content"] == text and out["total_lines"] == 6
     assert call(store, ref=REF, start_line=2, end_line=3)["content"] == "b\rc\n"
     assert "⟪HERMES-CONTEXT-COMPRESSION" in out["content"], "original text is returned untouched"
+
+
+def test_recovered_surrogates_are_escaped_for_utf8_transport_without_changing_text():
+    original = "日本語 🙂\ud800\n\udcff\n"
+    answer = expand(stocked(original), {"ref": REF})
+    assert json.loads(answer.encode("utf-8"))["content"] == original
+
+
+def test_recovered_non_ascii_text_is_not_escaped():
+    original = "日本語 café 🙂"
+    answer = expand(stocked(original), {"ref": REF})
+    assert original in answer
+    assert json.loads(answer.encode("utf-8"))["content"] == original
+
+
+@pytest.mark.parametrize("message", ["日本語 café 🙂", "日本語\ud800\ncafé\udcff"])
+def test_recovery_errors_preserve_unicode_and_escape_only_when_needed(message):
+    answer = _error(message, detail=message)
+    assert json.loads(answer.encode("utf-8")) == {"error": message, "detail": message}
+    if "\ud800" not in message:
+        assert message in answer
 
 
 def test_expand_accepts_loose_ref_and_numeric_spellings():

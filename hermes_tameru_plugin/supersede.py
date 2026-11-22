@@ -323,8 +323,12 @@ def _assess(call: ToolCall) -> _Outcome:
         next_offset = _as_int(payload.get("next_offset"))
         if next_offset is not None:
             span = (span[0], min(span[1], next_offset - 1))
-        elif span[1] == _OPEN or span[1] - span[0] >= _MAX_READ_LINES:
-            span = None  # cut at an unknown line (no limit, or a limit Hermes clamped)
+        else:
+            content = payload.get("content")
+            last = content.rstrip("\r\n").rsplit("\n", 1)[-1] if isinstance(content, str) else ""
+            numbered = re.match(r"^\s*(\d+)\|", last)
+            end = _as_int(numbered[1]) if numbered else None
+            span = (span[0], min(span[1], end)) if end is not None and end >= span[0] else None
     return _Outcome(ok=not failed and changed, live=live, span=span)
 
 
@@ -460,18 +464,21 @@ def superseded_by(index: SupersessionIndex, idx: int) -> tuple[int, str] | None:
     call = index.calls.get(idx)
     if call is None or idx in index.pending:
         return None
-    ok = call.assess().ok
+    outcome = call.assess()
+    ok = outcome.ok
+    span = outcome.span if outcome.span is not None else call.span
     if ok and call.tool in _READERS and call.path is not None:
         later = _nearest_later(index, index.writes.get(call.path), idx, _succeeded)
         if later is not None:
             return later, STALE_AFTER_WRITE
-    if ok and call.span is not None and call.path is not None:
-        later = _nearest_later(index, index.reads.get(call.path), idx, _covering(call.span))
+    if ok and span is not None and call.path is not None:
+        later = _nearest_later(index, index.reads.get(call.path), idx, _covering(span))
         if later is not None:
             return later, RE_READ
     if call.canon is not None:
         repeats = index.same_call.get((call.tool, call.canon))
-        later = _nearest_later(index, repeats, idx, _holds_content)
+        accept = _covering(span) if ok and call.tool == "read_file" and span is not None else _holds_content
+        later = _nearest_later(index, repeats, idx, accept)
         if later is not None:
             return later, REPEATED_CALL
     if ok and call.family is not None:
